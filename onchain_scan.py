@@ -19,19 +19,19 @@ written to results/*.csv so you never need to re-scan to reuse the numbers.
 
 Stdlib only (urllib). Run: python3 onchain_scan.py
 """
-import json, urllib.request, os, csv
+import json, urllib.request, os, csv, sys
 
 RPC   = "https://rpc.gnosischain.com"
 ADDR  = "0x8b4404DE0CaECE4b966a9959f134f0eFDa636156"          # the factory
 TOPIC = "0xa38789425dbeee0239e16ff2d2567e31720127fbc6430758c1a4efc6aef29f80"  # ProxyCreation(address)
 OUTDIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
 
-# --- issuance model constants ---
-T0_FALLBACK = 1602786380          # launch ts (Oct 15 2020 18:26:20 UTC), verified below
+# --- issuance model constants (all verified on-chain; see hub_constants.py) ---
 PERIOD      = 31556952            # Circles inflation period = 365.2425 days (seconds)
 WEEK        = 604800
-R0          = 8.0 / 86400.0       # tokens/sec, year 1
+R0          = 8.0 / 86400.0       # tokens/sec, year 1 (initialIssuance = 8 CRC/day)
 R1          = R0 * 1.07           # tokens/sec, year 2 (after +7% step)
+SIGNUP_BONUS = 50.0               # CRC minted once per signup (Hub `signupBonus` = 50e18 wei)
 
 def rpc(method, params):
     req = urllib.request.Request(
@@ -96,50 +96,86 @@ def scan_signups(start_block, end_block, t0):
     return hist, total
 
 def supply_at(hist, t0, T):
-    """Modelled accrued supply at time T from the weekly signup histogram.
-    Each user assumed to sign up at their week midpoint; integrate the piecewise rate."""
+    """Modelled supply at time T from the weekly signup histogram. Returns
+    (issuance_only, signup_bonus, cumulative_users). Each user is assumed to sign
+    up at their week midpoint; issuance integrates the piecewise rate, and each
+    signup contributes a one-time SIGNUP_BONUS the moment they join."""
     y1, y2 = t0 + PERIOD, t0 + 2 * PERIOD
     def overlap(a, b, lo, hi):
         return max(0.0, min(b, hi) - max(a, lo))
-    total = 0.0
+    issuance = 0.0
+    users = 0
     for w, c in hist.items():
         s = t0 + (w + 0.5) * WEEK
         if s >= T:
             continue
-        per_user = R0 * overlap(s, T, t0, y1) + R1 * overlap(s, T, y1, y2)
-        total += c * per_user
-    return total
+        users += c
+        issuance += c * (R0 * overlap(s, T, t0, y1) + R1 * overlap(s, T, y1, y2))
+    return issuance, users * SIGNUP_BONUS, users
+
+
+def load_hist_from_csv(path):
+    """Reload the weekly histogram (and t0) from a prior scan's CSV, so the supply
+    model can be recomputed instantly without re-downloading ~2 years of logs.
+    week 0's start timestamp is the launch time t0."""
+    hist, t0 = {}, None
+    with open(path) as f:
+        rd = csv.DictReader(f)
+        for row in rd:
+            w = int(row["week_index"]); hist[w] = int(row["signups"])
+            if w == 0:
+                t0 = int(row["week_start_utc_ts"])
+    return hist, t0
 
 def main():
     os.makedirs(OUTDIR, exist_ok=True)
-    tip = latest_block()
-    print(f"Chain tip: {tip}")
-    cblock = find_creation_block(tip)
-    t0 = block_ts(cblock)
-    print(f"Factory creation block: {cblock}  (ts {t0})")
+    hist_csv = os.path.join(OUTDIR, "signups_weekly.csv")
+    rescan = "--rescan" in sys.argv
 
-    # scan window: launch -> end of year 2 (covers the paper's milestones)
-    end_ts = t0 + 2 * PERIOD
-    end_block = find_block_at_ts(end_ts, cblock, tip)
-    print(f"Scanning to block {end_block} (end of year 2, ts {end_ts}) ...")
-    hist, total = scan_signups(cblock, end_block, t0)
-    print(f"Total signups scanned: {total}")
+    # Reuse the saved histogram if present (recompute the supply model instantly);
+    # otherwise scan the chain from scratch. Pass --rescan to force a fresh scan.
+    if os.path.exists(hist_csv) and not rescan:
+        hist, t0 = load_hist_from_csv(hist_csv)
+        print(f"Loaded weekly histogram from {hist_csv} (t0={t0}, {sum(hist.values())} signups). "
+              f"Use --rescan to re-download from chain.")
+    else:
+        tip = latest_block()
+        print(f"Chain tip: {tip}")
+        cblock = find_creation_block(tip)
+        t0 = block_ts(cblock)
+        print(f"Factory creation block: {cblock}  (ts {t0})")
+        end_block = find_block_at_ts(t0 + 2 * PERIOD, cblock, tip)
+        print(f"Scanning to block {end_block} (end of year 2) ...")
+        hist, total = scan_signups(cblock, end_block, t0)
+        print(f"Total signups scanned: {total}")
+        with open(hist_csv, "w", newline="") as f:
+            wr = csv.writer(f); wr.writerow(["week_index", "week_start_utc_ts", "signups"])
+            for w in sorted(hist):
+                wr.writerow([w, t0 + w * WEEK, hist[w]])
 
-    # write weekly histogram
-    with open(os.path.join(OUTDIR, "signups_weekly.csv"), "w", newline="") as f:
-        wr = csv.writer(f); wr.writerow(["week_index", "week_start_utc_ts", "signups"])
-        for w in sorted(hist):
-            wr.writerow([w, t0 + w * WEEK, hist[w]])
-
-    # write supply curve at the paper's milestones
+    # supply curve at the paper's milestones: issuance alone vs. incl. signup bonus
     milestones = [("Month %d (%dd)" % (m, m*30), t0 + m*2592000) for m in (1,2,3,4,5,6,12,13,18)]
     milestones += [("Year 1 (365.24d)", t0 + PERIOD), ("Year 2 (730.5d)", t0 + 2*PERIOD)]
+    rows = []
+    for label, T in milestones:
+        issuance, bonus, users = supply_at(hist, t0, T)
+        rows.append((label, T, users, round(issuance), round(bonus), round(issuance + bonus)))
+
     with open(os.path.join(OUTDIR, "supply_over_time.csv"), "w", newline="") as f:
-        wr = csv.writer(f); wr.writerow(["milestone", "target_utc_ts", "cumulative_users", "accrued_supply"])
-        for label, T in milestones:
-            users = sum(c for w, c in hist.items() if t0 + (w + 0.5) * WEEK < T)
-            wr.writerow([label, T, users, round(supply_at(hist, t0, T))])
-    print(f"Wrote CSVs to {OUTDIR}/")
+        wr = csv.writer(f)
+        wr.writerow(["milestone", "target_utc_ts", "cumulative_users",
+                     "issuance_only", "signup_bonus_50crc", "total_with_bonus"])
+        for r in rows:
+            wr.writerow(r)
+
+    # human-readable summary
+    print(f"\nSignup bonus = {SIGNUP_BONUS:g} CRC/user (Hub `signupBonus`, on-chain verified)\n")
+    print(f"{'Milestone':<18} {'Users':>9} {'Issuance only':>16} {'+ Bonus':>14} {'Total':>16} {'bonus%':>7}")
+    print("-" * 84)
+    for label, T, users, iss, bon, tot in rows:
+        pct = bon / iss * 100 if iss else 0.0
+        print(f"{label:<18} {users:>9,} {iss:>16,} {bon:>14,} {tot:>16,} {pct:>6.1f}%")
+    print(f"\nWrote CSVs to {OUTDIR}/")
 
 if __name__ == "__main__":
     main()
